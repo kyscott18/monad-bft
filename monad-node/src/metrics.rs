@@ -21,11 +21,11 @@ use std::{
 };
 
 use actix_server::Server;
-use actix_web::{http::header, web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpResponse, HttpServer};
 use monad_consensus_types::metrics::Metrics as StateMetrics;
 use monad_executor::{metric_consts, ExecutorMetrics, ExecutorMetricsChain, Gauge};
 use monad_triedb_utils::{MigrationPhase, StorageStats, TriedbStatsReader, UpdateStats};
-use prometheus::{Encoder, ProtobufEncoder, Registry, TextEncoder};
+use prometheus::{Encoder, Registry, TextEncoder};
 use tracing::{info, warn};
 
 pub fn default_prometheus_labels(
@@ -351,43 +351,23 @@ impl MetricsServerState {
     }
 }
 
-fn wants_protobuf(request: &HttpRequest) -> bool {
-    // Prometheus negotiates scrape response format with the request Accept header:
-    // https://prometheus.io/docs/instrumenting/content_negotiation/
-    request
-        .headers()
-        .get(header::ACCEPT)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.contains(prometheus::PROTOBUF_FORMAT))
-}
-
-async fn handle_metrics(
-    request: HttpRequest,
-    state: web::Data<MetricsServerState>,
-) -> HttpResponse {
+async fn handle_metrics(state: web::Data<MetricsServerState>) -> HttpResponse {
     if let Some(before_gather) = &state.before_gather {
         before_gather();
     }
 
-    let metric_families = state.registry.gather();
+    // todo: support protobuf with proper accept-header negotiation.
+    let encoder = TextEncoder::new();
     let mut buffer = Vec::new();
-
-    let content_type = if wants_protobuf(&request) {
-        let encoder = ProtobufEncoder::new();
-        if encoder.encode(&metric_families, &mut buffer).is_err() {
-            return HttpResponse::InternalServerError().finish();
-        }
-        prometheus::PROTOBUF_FORMAT
-    } else {
-        let encoder = TextEncoder::new();
-        if encoder.encode(&metric_families, &mut buffer).is_err() {
-            return HttpResponse::InternalServerError().finish();
-        }
-        prometheus::TEXT_FORMAT
-    };
+    if encoder
+        .encode(&state.registry.gather(), &mut buffer)
+        .is_err()
+    {
+        return HttpResponse::InternalServerError().finish();
+    }
 
     HttpResponse::Ok()
-        .insert_header((header::CONTENT_TYPE, content_type))
+        .content_type(encoder.format_type())
         .body(buffer)
 }
 

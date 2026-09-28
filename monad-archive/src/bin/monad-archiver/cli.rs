@@ -22,6 +22,7 @@ use std::{
 use clap::{ArgAction, Parser, Subcommand};
 use eyre::{eyre, Context, Result};
 use monad_archive::cli::{ArchiveArgs, BlockDataReaderArgs};
+use monad_metrics::MetricsConfig;
 use serde::Deserialize;
 
 /// Runtime configuration for the `monad-archiver` binary.
@@ -134,11 +135,10 @@ pub struct Cli {
     #[serde(default)]
     pub unsafe_allow_traces_overwrite: bool,
 
-    pub otel_endpoint: Option<String>,
+    #[serde(flatten)]
+    pub metrics: MetricsConfig,
 
     pub otel_replica_name_override: Option<String>,
-
-    pub metrics_listen_addr: Option<std::net::SocketAddr>,
 
     #[serde(default)]
     pub skip_connectivity_check: bool,
@@ -209,9 +209,8 @@ impl Cli {
             unsafe_allow_blocks_overwrite,
             unsafe_allow_receipts_overwrite,
             unsafe_allow_traces_overwrite,
-            otel_endpoint,
+            metrics,
             otel_replica_name_override,
-            metrics_listen_addr,
             skip_connectivity_check,
             require_traces,
             traces_only,
@@ -251,9 +250,8 @@ impl Cli {
             unsafe_allow_blocks_overwrite: unsafe_allow_blocks_overwrite.unwrap_or(false),
             unsafe_allow_receipts_overwrite: unsafe_allow_receipts_overwrite.unwrap_or(false),
             unsafe_allow_traces_overwrite: unsafe_allow_traces_overwrite.unwrap_or(false),
-            otel_endpoint,
+            metrics,
             otel_replica_name_override,
-            metrics_listen_addr,
             skip_connectivity_check: skip_connectivity_check.unwrap_or(false),
             require_traces: require_traces.unwrap_or(false),
             traces_only: traces_only.unwrap_or(false),
@@ -328,14 +326,9 @@ impl Cli {
         if let Some(value) = overrides.unsafe_allow_traces_overwrite {
             self.unsafe_allow_traces_overwrite = value;
         }
-        if let Some(value) = overrides.otel_endpoint {
-            self.otel_endpoint = Some(value);
-        }
+        self.metrics.apply_overrides(overrides.metrics);
         if let Some(value) = overrides.otel_replica_name_override {
             self.otel_replica_name_override = Some(value);
-        }
-        if let Some(value) = overrides.metrics_listen_addr {
-            self.metrics_listen_addr = Some(value);
         }
         if let Some(value) = overrides.skip_connectivity_check {
             self.skip_connectivity_check = value;
@@ -474,14 +467,11 @@ struct CliArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     unsafe_allow_traces_overwrite: bool,
 
-    #[arg(long)]
-    otel_endpoint: Option<String>,
+    #[command(flatten)]
+    metrics: MetricsConfig,
 
     #[arg(long)]
     otel_replica_name_override: Option<String>,
-
-    #[arg(long)]
-    metrics_listen_addr: Option<std::net::SocketAddr>,
 
     #[arg(long, action = ArgAction::SetTrue)]
     skip_connectivity_check: bool,
@@ -518,9 +508,8 @@ impl CliArgs {
             additional_dirs_to_archive,
             additional_dirs_archive_freq_secs,
             additional_dirs_exclude_prefix,
-            otel_endpoint,
+            metrics,
             otel_replica_name_override,
-            metrics_listen_addr,
             skip_connectivity_check,
             unsafe_disable_normal_archiving,
             unsafe_allow_overwrite,
@@ -550,9 +539,8 @@ impl CliArgs {
             additional_dirs_to_archive,
             additional_dirs_archive_freq_secs,
             additional_dirs_exclude_prefix,
-            otel_endpoint,
+            metrics,
             otel_replica_name_override,
-            metrics_listen_addr,
             skip_connectivity_check: bool_override(skip_connectivity_check),
             unsafe_disable_normal_archiving: bool_override(unsafe_disable_normal_archiving),
             unsafe_allow_overwrite: bool_override(unsafe_allow_overwrite),
@@ -590,9 +578,8 @@ struct CliOverrides {
     additional_dirs_to_archive: Option<Vec<PathBuf>>,
     additional_dirs_archive_freq_secs: Option<f64>,
     additional_dirs_exclude_prefix: Option<String>,
-    otel_endpoint: Option<String>,
+    metrics: MetricsConfig,
     otel_replica_name_override: Option<String>,
-    metrics_listen_addr: Option<std::net::SocketAddr>,
     skip_connectivity_check: Option<bool>,
     unsafe_disable_normal_archiving: Option<bool>,
     unsafe_allow_overwrite: Option<bool>,
@@ -671,6 +658,7 @@ mod tests {
             additional_dirs_exclude_prefix = ".skip"
             unsafe_disable_normal_archiving = true
             otel_endpoint = "http://otel"
+            metrics_listen_addr = "127.0.0.1:9145"
             otel_replica_name_override = "special"
             skip_connectivity_check = true
             require_traces = true
@@ -713,7 +701,11 @@ mod tests {
         assert_eq!(cli.additional_dirs_archive_freq_secs, 7.5);
         assert_eq!(cli.additional_dirs_exclude_prefix, ".skip");
         assert!(cli.unsafe_disable_normal_archiving);
-        assert_eq!(cli.otel_endpoint.as_deref(), Some("http://otel"));
+        assert_eq!(cli.metrics.otel_endpoint.as_deref(), Some("http://otel"));
+        assert_eq!(
+            cli.metrics.metrics_listen_addr,
+            Some("127.0.0.1:9145".parse().unwrap())
+        );
         assert_eq!(cli.otel_replica_name_override.as_deref(), Some("special"));
         assert!(cli.skip_connectivity_check);
         assert!(cli.require_traces);
@@ -843,6 +835,8 @@ mod tests {
             file,
             r#"
             max_blocks_per_iteration = 50
+            otel_endpoint = "http://otel-config:4317"
+            metrics_listen_addr = "127.0.0.1:9145"
 
             [block_data_source]
             type = "aws"
@@ -864,11 +858,38 @@ mod tests {
             "123",
             "--block-data-source",
             "aws cli-bucket",
+            "--metrics-listen-addr",
+            "127.0.0.1:19145",
         ])
         .into_cli()
         .expect("cli overrides should succeed");
 
         assert_eq!(cli.max_blocks_per_iteration, 123);
+        assert_eq!(
+            cli.metrics.otel_endpoint.as_deref(),
+            Some("http://otel-config:4317")
+        );
+        assert_eq!(
+            cli.metrics.metrics_listen_addr,
+            Some("127.0.0.1:19145".parse().unwrap())
+        );
+        let (_, otel_override) = CliArgs::parse_from([
+            "monad-archiver",
+            "--config",
+            file.path().to_str().unwrap(),
+            "--otel-endpoint",
+            "http://otel-cli:4317",
+        ])
+        .into_cli()
+        .unwrap();
+        assert_eq!(
+            otel_override.metrics.otel_endpoint.as_deref(),
+            Some("http://otel-cli:4317")
+        );
+        assert_eq!(
+            otel_override.metrics.metrics_listen_addr,
+            Some("127.0.0.1:9145".parse().unwrap())
+        );
         match cli.block_data_source {
             BlockDataReaderArgs::Aws(args) => {
                 assert_eq!(args.bucket, "cli-bucket");
